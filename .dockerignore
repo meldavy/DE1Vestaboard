@@ -1,0 +1,11 @@
+.git
+.gitignore
+.dockerignore
+*.md
+!README.md
+*.pyc
+__pycache__
+*.egg-info
+.DS_Store
+.junie/
+.idea/

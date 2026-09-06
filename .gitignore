@@ -1,0 +1,9 @@
+*.iml
+.idea/
+.junie/
+Makefile
+build.sh
+run.sh
+specs
+__pycache__/
+*.pyc
