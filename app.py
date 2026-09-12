@@ -7,6 +7,7 @@ to Vestaboard when the machine transitions from sleep to wake.
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -501,10 +502,32 @@ def wrap_text(text, width):
     return lines
 
 
-def build_shot_layout(title, profile, time_s, temp_c, water_ml):
+def parse_shot_weight_g(payload):
+    """Extract the scale-based shot weight in grams from a state payload.
+
+    The decaid MQTT plugin adds `shot_weight_g` when a scale is connected:
+    the live in-shot weight during a shot and the final yield afterwards.
+    Returns None (falling back to the water tank level) when the field is
+    absent, null, or not a finite, non-negative number.
+    """
+    raw = payload.get("shot_weight_g")
+    if raw is None:
+        return None
+    try:
+        weight = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(weight) or weight < 0:
+        return None
+    return weight
+
+
+def build_shot_layout(title, profile, time_s, temp_c, vol_str):
     """Build the 6x22 grid shown on the Vestaboard during a shot.
 
     `title` is the centered heading (the cafe/shop name from the layout file).
+    `vol_str` is the preformatted VOL value: the scale-measured shot weight in
+    grams when a scale is connected, otherwise the remaining water tank level.
     """
     if time_s is not None:
         t = int(time_s)
@@ -513,7 +536,6 @@ def build_shot_layout(title, profile, time_s, temp_c, water_ml):
         time_str = "--"
 
     temp_str = f"{temp_c:.1f}" if temp_c is not None else "--"
-    vol_str = f"{int(round(water_ml))}" if water_ml is not None else "--"
 
     profile_lines = wrap_text((profile or "").upper(), 22)
     if len(profile_lines) < 2:
@@ -562,7 +584,14 @@ def handle_shot_message(payload):
     substate = payload.get("substate", "") or ""
     profile = payload.get("profile", "")
     temp_c = payload.get("head_temperature")
-    water_ml = payload.get("water_level_ml")
+    shot_weight_g = parse_shot_weight_g(payload)
+    # Prefer the live scale weight when a scale is connected; otherwise fall
+    # back to the remaining water tank level.
+    if shot_weight_g is not None:
+        vol_str = f"{shot_weight_g:.1f}"
+    else:
+        water_ml = payload.get("water_level_ml")
+        vol_str = f"{int(round(water_ml))}" if water_ml is not None else "--"
 
     def current_shot_time():
         if frozen_time is not None:
@@ -591,7 +620,7 @@ def handle_shot_message(payload):
             frozen_time = current_shot_time()
             logger.info(f"Shot timer ended (substate: ending): {frozen_time:.0f}s")
         last_shot_layout = build_shot_layout(
-            load_shot_title(), profile, current_shot_time(), temp_c, water_ml
+            load_shot_title(), profile, current_shot_time(), temp_c, vol_str
         )
         submit_layout(last_shot_layout)
     else:
@@ -610,7 +639,7 @@ def handle_shot_message(payload):
             timer_start = None
             frozen_time = None
             last_shot_layout = build_shot_layout(
-                load_shot_title(), profile, time_s, temp_c, water_ml
+                load_shot_title(), profile, time_s, temp_c, vol_str
             )
             submit_layout(last_shot_layout)
             logger.info(f"Shot ended; finalized {time_s:.0f}s")
