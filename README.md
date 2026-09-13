@@ -11,7 +11,7 @@ Subscribes to the DE1+ MQTT state topic and displays status on a Vestaboard:
   - `TIME  TEMP  VOL` headers with live values
     - **Time** shows `0:00` the moment the shot enters the `Espresso` state, then starts counting only once the DE1 reaches the `preinfusion` or `pouring` substate. It stops on the `ending` substate or when the machine leaves `Espresso`.
     - **Temp** is the DE1 `head_temperature`.
-    - **Vol** is the tank water level (`water_level_ml`) — the shot-scale weight is **not** exposed by the `de1plus-mqtt` plugin, so this is a tank indicator, not shot yield.
+    - **Vol** is the scale-measured shot weight (`shot_weight_g`, shown with one decimal) when a scale is connected via the [decaid-mqtt-plugin](https://github.com/meldavy/decaid-mqtt-plugin) — live during the shot, and the final yield afterwards. When the field is absent/null/invalid (no scale, or the older `de1plus-mqtt` plugin), it falls back to the tank water level (`water_level_ml`).
 
 ---
 
@@ -130,7 +130,7 @@ The working directory must contain `startup_layout.json` (or point `STARTUP_LAYO
 ### Notes & limitations
 
 - The DE1 community `de1plus-mqtt` plugin publishes **immediately on every state/substate change** (e.g. wake, and each espresso phase: `preinfusion` → `pouring` → `ending`), and additionally sends a heartbeat every `publish_interval_ms` (default 60000) when nothing changes. Mid-shot updates are event-driven and no plugin setting needs to change; the bridge rate-limits Vestaboard posts itself via `POST_INTERVAL_SEC`.
-- The plugin does **not** publish per-shot scale weight or a shot clock, so shot duration is measured locally (displayed as `m:ss`) and "Vol" maps to tank water level. To show true shot weight, you'd need a source that forwards `espresso_weight` (e.g. Decent's local `web_api` plugin or a custom MQTT bridge).
+- With the [decaid-mqtt-plugin](https://github.com/meldavy/decaid-mqtt-plugin) and a connected scale, `shot_weight_g` gives the live shot weight/final yield (used for "Vol"). The `de1plus-mqtt` plugin does **not** publish shot weight, so with it "Vol" maps to tank water level and shot duration is measured locally (displayed as `m:ss`).
 - The Vestaboard has **no lowercase letters** — all display text is uppercased, and only characters in the official character set render.
 
 ---
@@ -328,11 +328,14 @@ The bridge subscribes to `<MQTT_PREFIX>/<MQTT_TOPIC>` (default `de1/state`). A t
   "wake_state": true,
   "profile": "Melange",
   "head_temperature": 93.5,
-  "water_level_ml": 720
+  "water_level_ml": 720,
+  "scale_connected": true,
+  "shot_active": true,
+  "shot_weight_g": 18.3
 }
 ```
 
-Fields used: `state`, `substate`, `wake_state`, `profile`, `head_temperature`, `water_level_ml`. Anything else in the payload is ignored.
+Fields used: `state`, `substate`, `wake_state`, `profile`, `head_temperature`, `water_level_ml`, and the decaid extensions `scale_connected`, `shot_active`, and `shot_weight_g` (when valid, `shot_weight_g` takes precedence over `water_level_ml` for the VOL display; `scale_connected` — or, if absent, any observed `shot_weight_g` — switches the display to shot-weight mode so a starting shot reads `0.0` instead of tank level). Anything else in the payload is ignored.
 
 ---
 

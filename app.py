@@ -77,12 +77,29 @@ frozen_time = None  # final shot time captured at "ending" substate
 last_shot_layout = None
 _last_shot_end = None
 
+# Scale/weight tracking. The decaid plugin publishes `scale_connected`, and
+# `shot_weight_g` (live during a shot, final yield afterwards) when a scale is
+# attached; the final yield can arrive in a message after the machine has
+# already left the Espresso state (the plugin publishes on both machine state
+# changes and shot-detail changes, so the state -> Idle document can beat the
+# shot-record document). These track what we know across messages:
+scale_connected = False       # from `scale_connected`, or inferred from weight data
+current_shot_weight_g = None  # weight for the active/most recent shot (0.0 at start)
+last_finalized_weight = None  # weight value shown on the last finalized shot screen
+last_shot_time_s = None       # finalized time, so post-shot yield updates keep it
+
 # Ignore shot start/end flapping from the DE1 at shot boundaries so a spurious
 # ~0s "phantom" shot (Espresso -> Idle within a few seconds, as the machine
 # settles after a real shot) can't overwrite the real final shot time. Real
 # espresso shots are always much longer than this and are preceded by a
 # multi-second idle/prep gap, so this window is safe.
 SHOT_DEBOUNCE_SEC = float(os.environ.get("SHOT_DEBOUNCE_SEC", "15"))
+
+# The decaid plugin reports the final yield right around shot completion, but
+# it can arrive in a message after the machine has already left the Espresso
+# state (notably on very fast shots). For this long after a shot ends, a new
+# valid `shot_weight_g` still refreshes the finalized shot screen.
+FINAL_WEIGHT_WINDOW_SEC = float(os.environ.get("FINAL_WEIGHT_WINDOW_SEC", "120"))
 
 # Serialized send logic:
 #  - pending_layout  : the newest layout we want to show
@@ -538,7 +555,7 @@ def build_shot_layout(title, profile, time_s, temp_c, vol_str):
     temp_str = f"{temp_c:.1f}" if temp_c is not None else "--"
 
     profile_lines = wrap_text((profile or "").upper(), 22)
-    if len(profile_lines) < 2:
+    while len(profile_lines) < 2:
         profile_lines.append("")
 
     layout = [
@@ -577,21 +594,34 @@ def handle_shot_message(payload):
     0:00), but the timer only begins once the DE1 reaches "preinfusion" or
     "pouring" (whichever comes first). It stops on the "ending" substate or
     when we leave the Espresso state.
+
+    Volume display: when a scale is connected (any valid `shot_weight_g` has
+    been observed), VOL shows the shot weight — 0.0 at shot start, live weight
+    during the shot, and the final yield afterwards. Only when no scale has
+    been seen does it fall back to the remaining water tank level. Because the
+    plugin can report the final yield in a message that arrives after the
+    machine has already left the Espresso state, a new valid weight within
+    FINAL_WEIGHT_WINDOW_SEC of shot end refreshes the finalized screen.
     """
     global shot_active, timer_start, frozen_time, last_shot_layout, _last_shot_end
+    global scale_connected, current_shot_weight_g, last_finalized_weight, last_shot_time_s
 
     state = payload.get("state", "Unknown")
     substate = payload.get("substate", "") or ""
     profile = payload.get("profile", "")
     temp_c = payload.get("head_temperature")
-    shot_weight_g = parse_shot_weight_g(payload)
-    # Prefer the live scale weight when a scale is connected; otherwise fall
-    # back to the remaining water tank level.
-    if shot_weight_g is not None:
-        vol_str = f"{shot_weight_g:.1f}"
-    else:
-        water_ml = payload.get("water_level_ml")
-        vol_str = f"{int(round(water_ml))}" if water_ml is not None else "--"
+
+    weight_g = parse_shot_weight_g(payload)
+    # Scale presence: prefer the plugin's explicit `scale_connected` field;
+    # infer from weight data for sources that don't send it (de1app plugin).
+    scale_field = payload.get("scale_connected")
+    if isinstance(scale_field, bool):
+        if scale_field != scale_connected:
+            logger.info(f"Scale {'connected' if scale_field else 'disconnected'}")
+            scale_connected = scale_field
+    elif weight_g is not None and not scale_connected:
+        logger.info("Scale connected (first shot_weight_g received)")
+        scale_connected = True
 
     def current_shot_time():
         if frozen_time is not None:
@@ -600,9 +630,17 @@ def handle_shot_message(payload):
             return time.monotonic() - timer_start
         return 0
 
+    def vol_str_for(weight):
+        """Format the VOL value: shot weight when known, tank level otherwise."""
+        if weight is not None:
+            return f"{weight:.1f}"
+        water_ml = payload.get("water_level_ml")
+        return f"{int(round(water_ml))}" if water_ml is not None else "--"
+
     now = time.monotonic()
     in_espresso = state == "Espresso"
     phase_started = substate in ("preinfusion", "pouring")
+    started_this_message = False
 
     if in_espresso:
         if not shot_active:
@@ -612,7 +650,14 @@ def handle_shot_message(payload):
             shot_active = True
             timer_start = None
             frozen_time = None
+            # A new shot starts at 0g. The payload's shot_weight_g, if any, is
+            # still the previous shot's final yield, so ignore it here.
+            current_shot_weight_g = 0.0 if scale_connected else None
+            started_this_message = True
             logger.info("Shot started")
+        if weight_g is not None and not started_this_message:
+            current_shot_weight_g = weight_g
+            logger.info(f"Shot weight: {weight_g:.1f}g")
         if timer_start is None and phase_started:
             timer_start = now
             logger.info(f"Shot timer started (substate: {substate})")
@@ -620,7 +665,8 @@ def handle_shot_message(payload):
             frozen_time = current_shot_time()
             logger.info(f"Shot timer ended (substate: ending): {frozen_time:.0f}s")
         last_shot_layout = build_shot_layout(
-            load_shot_title(), profile, current_shot_time(), temp_c, vol_str
+            load_shot_title(), profile, current_shot_time(), temp_c,
+            vol_str_for(current_shot_weight_g)
         )
         submit_layout(last_shot_layout)
     else:
@@ -631,18 +677,41 @@ def handle_shot_message(payload):
                 shot_active = False
                 timer_start = None
                 frozen_time = None
+                current_shot_weight_g = None
+                last_finalized_weight = None
                 _last_shot_end = now
                 return
             time_s = current_shot_time()
+            final_weight = weight_g if weight_g is not None else current_shot_weight_g
             shot_active = False
             _last_shot_end = now
             timer_start = None
             frozen_time = None
+            last_finalized_weight = final_weight
+            last_shot_time_s = time_s
             last_shot_layout = build_shot_layout(
-                load_shot_title(), profile, time_s, temp_c, vol_str
+                load_shot_title(), profile, time_s, temp_c, vol_str_for(final_weight)
             )
             submit_layout(last_shot_layout)
-            logger.info(f"Shot ended; finalized {time_s:.0f}s")
+            logger.info(f"Shot ended; finalized {time_s:.0f}s, {final_weight}g")
+        elif (
+            weight_g is not None
+            and weight_g != last_finalized_weight
+            and _last_shot_end is not None
+            and (now - _last_shot_end) <= FINAL_WEIGHT_WINDOW_SEC
+        ):
+            # The final yield was reported (or corrected) after the shot state
+            # already ended -- refresh the finalized screen with the new value.
+            logger.info(
+                f"Final yield update after shot end: {weight_g:.1f}g "
+                f"(was {last_finalized_weight}g)"
+            )
+            last_finalized_weight = weight_g
+            last_shot_layout = build_shot_layout(
+                load_shot_title(), profile, last_shot_time_s, temp_c,
+                vol_str_for(weight_g)
+            )
+            submit_layout(last_shot_layout)
 
 
 
@@ -709,7 +778,9 @@ def on_message(client, userdata, msg):
     wake_state = payload.get("wake_state", None)
     state = payload.get("state", "Unknown")
 
-    logger.info(f"Received state: {state}, wake_state: {wake_state}")
+    # Log the full payload so shot weight / fallback behavior can be debugged
+    # from the logs without guessing at what the plugin sent.
+    logger.info(f"Received state: {state}, wake_state: {wake_state}, payload: {payload}")
 
     # Detect sleep -> wake transition
     if wake_state is not None and previous_wake_state is not None:
